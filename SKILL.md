@@ -1,7 +1,7 @@
 ---
 name: feature-pointer
-version: 1.0.0
-description: "After shipping a new UI feature, capture a browser screenshot and annotate it with a green arrow pointing to the new element. Use this skill proactively after any UI change so the user can instantly see what changed and where. Trigger phrases: 'show me where', 'point to the feature', 'annotate the screenshot', or automatically after any deploy."
+version: 2.0.0
+description: "Point to a UI feature on the current browser page. Takes a screenshot, draws a green arrow + callout on the element, and shows the annotated image inline. Invoke with /feature-pointer or /feature-pointer 'element description'. Trigger automatically after any UI deploy."
 metadata:
   category: ui-verification
   requires: [python, pillow]
@@ -9,75 +9,123 @@ metadata:
 
 # Feature Pointer
 
-Captures the current browser state via Orellius and draws a green annotated arrow pointing to a newly deployed UI element. Eliminates "where is the new button?" questions.
+You are running the `/feature-pointer` skill. Your job: take a screenshot of the browser, find the target element, annotate it with a green arrow, and show the result inline. Be conversational — ask one question if needed, then execute.
 
-## When to Use
+---
 
-Use this **proactively after every UI deploy** — do not wait for the user to ask. As soon as a feature is live and the page is open in Orellius, run this skill and show the annotated screenshot.
+## Step 1 — Figure out what to point to
 
-## How to Use
+Check the conversation for context. The user may have:
+- Just deployed a feature ("I added a toggle", "the new button is live")
+- Passed an argument after `/feature-pointer` ("show me the export button")
+- Said nothing specific
 
-```
-/feature-pointer
-```
+**If it's clear** from context what element to highlight: proceed silently.
 
-Or Claude invokes it automatically after shipping a UI change.
+**If it's ambiguous**: ask ONE short question — "What element should I point to?" — then wait for the answer before continuing.
 
-## What Claude Does
+---
 
-### Step 1 — Take a screenshot
-Use the Orellius browser bridge to capture the current page:
+## Step 2 — Take a screenshot
+
+Use Orellius to capture the current browser state:
+
 ```
 mcp__orellius-browser-bridge__computer action=screenshot
 ```
-Save the result bytes to `C:\Users\raviv\Downloads\fp-raw.png`.
 
-If Orellius is not connected, ask the user to share a screenshot instead and skip to Step 3.
+Then save a clean copy using playwright so you have a file on disk:
 
-### Step 2 — Find the feature coordinates
-Use one of:
-- `mcp__orellius-browser-bridge__find` with the element's text or CSS selector to get bounding box
-- Context from the conversation (e.g. "toggle at top of controls section")
-- `mcp__orellius-browser-bridge__javascript_tool` to query `element.getBoundingClientRect()`
+```python
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    browser = p.chromium.launch()
+    page = browser.new_page(viewport={'width': 516, 'height': 844})
+    page.goto('<current page URL>')
+    page.wait_for_timeout(2000)
+    page.screenshot(path='C:/Users/raviv/Downloads/fp-raw.png')
+    browser.close()
+```
 
-Get either:
-- A **point** `(x, y)` — center of the element
-- A **region** `(x1, y1, x2, y2)` — bounding box of the element (preferred when available)
+**If Orellius is not connected**: ask the user to paste a screenshot, save it as `C:\Users\raviv\Downloads\fp-raw.png`, then continue to Step 3.
 
-### Step 3 — Annotate
+---
+
+## Step 3 — Find the element's bounding box
+
+Try these in order, stop when you get coordinates:
+
+**Option A** — JavaScript getBoundingClientRect (most reliable):
+```javascript
+// via mcp__orellius-browser-bridge__javascript_tool
+const el = document.querySelector('#element-id') || document.querySelector('[data-label="..."]');
+const r = el.getBoundingClientRect();
+JSON.stringify({x1: Math.round(r.left), y1: Math.round(r.top), x2: Math.round(r.right), y2: Math.round(r.bottom)});
+```
+
+**Option B** — Orellius find by text:
+```
+mcp__orellius-browser-bridge__find text="button label or element text"
+```
+
+**Option C** — Visual estimate from the screenshot (use as fallback if DOM query fails).
+
+---
+
+## Step 4 — Annotate
+
+Run annotate.py with the bounding box you found:
+
 ```bash
 python "C:\Users\raviv\.claude\skills\feature-pointer\annotate.py" \
   --input "C:\Users\raviv\Downloads\fp-raw.png" \
-  --x 400 --y 285 \
-  --label "New: Posts / Videos toggle" \
+  --region <x1> <y1> <x2> <y2> \
+  --label "<short description of the feature>" \
   --output "C:\Users\raviv\Downloads\fp-annotated.png"
 ```
 
-Or with a region (more precise):
+Or with a center point if you only have that:
+
 ```bash
 python "C:\Users\raviv\.claude\skills\feature-pointer\annotate.py" \
   --input "C:\Users\raviv\Downloads\fp-raw.png" \
-  --region 466 272 620 300 \
-  --label "New: Posts / Videos toggle" \
+  --x <cx> --y <cy> \
+  --label "<short description>" \
   --output "C:\Users\raviv\Downloads\fp-annotated.png"
 ```
 
-### Step 4 — Show the result
+---
+
+## Step 5 — Show it
+
 ```
 Read C:\Users\raviv\Downloads\fp-annotated.png
 ```
 
-Display the image inline. Do NOT just say "saved to X" — show it.
+Display the image inline. **Do NOT** just say "saved to X path" — show the actual image.
 
-## annotate.py Reference
+After showing it, say one sentence about what you highlighted and how to interact with it.
+
+---
+
+## annotate.py flags
 
 | Flag | Description |
 |------|-------------|
 | `--input` | Source screenshot path |
 | `--output` | Output path for annotated image |
 | `--label` | Text shown in the green callout box |
-| `--x --y` | Center point of element (integer pixels) |
-| `--region x1 y1 x2 y2` | Bounding box (preferred over point) |
+| `--x --y` | Center point (integer pixels) |
+| `--region x1 y1 x2 y2` | Bounding box (preferred) |
+
+---
+
+## Notes
+
+- The skill junction is at `C:\Users\raviv\.claude\skills\feature-pointer\` pointing to `E:\FromC\projects\feature-pointer`
+- Always use the junction path when invoking annotate.py so it works from any working directory
+- Label text should be short and descriptive: "New: Posts / Videos toggle" not "This is the new toggle that was added"
+- If the callout box overlaps the element, annotate.py auto-repositions it above or below
 
 ## Requirements
 
@@ -85,10 +133,4 @@ Display the image inline. Do NOT just say "saved to X" — show it.
 pip install Pillow
 ```
 
-Python 3.8+. No other dependencies.
-
-## Project Location
-
-- Local: `E:\FromC\projects\feature-pointer`
-- GitHub: https://github.com/kivimedia/feature-pointer
-- Skill symlink: `C:\Users\raviv\.claude\skills\feature-pointer\`
+Python 3.8+, playwright (`pip install playwright && playwright install chromium`).
